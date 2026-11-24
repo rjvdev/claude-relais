@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Lance Claude Code sur le compte actif et bascule sur l'autre à 90 % (5 h ou semaine, si la bascule auto est activée)
+# ou sur demande (menu du panneau, claude-relais-ctl basculer), avec passation, en reprenant la même session.
+# Usage : claude-relais [arguments de claude…]
+ctl="$HOME/.local/bin/claude-relais-ctl"
+"$HOME/.local/bin/claude-sync-mcp" 2>/dev/null || true
+etat=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/claude-relais.XXXXXX"); trap 'rm -rf "${etat:?}"' EXIT
+nom_de() { "$ctl" status --json | jq -r --arg c "${1:-~/.claude}" '.comptes[] | select(.config == $c) | .nom'; }
+lancer() {  # $1 = config (« - » = ~/.claude), reste = arguments de claude
+  local cfg="$1"; shift
+  ( if [ "$cfg" = "-" ]; then exec env -u CLAUDE_CONFIG_DIR CLAUDE_RELAIS_DIR="$etat" claude "$@"
+    else exec env CLAUDE_CONFIG_DIR="$cfg" CLAUDE_RELAIS_DIR="$etat" claude "$@"; fi ); }
+cfg=$("$ctl" choisir) || { echo "claude-relais : aucun compte connecté" >&2; exit 1; }
+echo "claude-relais : démarrage sur $(nom_de "$([ "$cfg" = - ] || echo "$cfg")")"
+lancer "$cfg" "$@"
+while [ -f "$etat/bascule" ]; do
+  read -r sid avant mode < "$etat/bascule"; rm -f "$etat/bascule"
+  stty sane 2>/dev/null; tput rmcup 2>/dev/null || true
+  cfg=$("$ctl" choisir --eviter "$avant") || { echo "claude-relais : pas d'autre compte disponible" >&2; exit 1; }
+  apres=$(nom_de "$([ "$cfg" = - ] || echo "$cfg")")
+  echo "claude-relais : bascule $avant → $apres (session ${sid})"
+  if [ "$mode" = faite ]; then
+    msg="Bascule de compte ($avant → $apres) : la passation est faite dans HANDOFF.md. Reprends la tâche en cours s'il y en avait une ; sinon, attends ma prochaine demande sans rien faire."
+  else
+    msg="Bascule de compte ($avant → $apres) demandée pendant que la session attendait. Mets d'abord à jour le HANDOFF.md concerné (passation de cette session, selon le protocole du CLAUDE.md du projet), puis attends ma prochaine demande."
+  fi
+  if [ "$sid" = "-" ]; then lancer "$cfg"; else lancer "$cfg" --resume "$sid" "$msg"; fi
+done

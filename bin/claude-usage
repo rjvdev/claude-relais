@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Usage des deux comptes Claude (dernière valeur vue par la barre d'état de chacun).
+# shellcheck source=bin/claude-usage-lib.sh
+. "$HOME/.local/bin/claude-usage-lib.sh"
+for n in $(cu_noms); do read -r s w age <<<"$(cu_lire "$n")"
+  printf '%-6s %s/%s   (vu il y a %s min)\n' "$n" "$s" "$w" "$age"; done

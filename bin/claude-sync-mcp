@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Recopie les serveurs MCP utilisateur de ~/.claude.json vers les autres comptes (seul fichier non partagé par lien).
+set -e; src="$HOME/.claude.json"
+while IFS= read -r d; do [ -n "$d" ] || continue; f="$d/.claude.json"; [ -f "$f" ] || continue
+  jq --slurpfile s "$src" '.mcpServers = ($s[0].mcpServers // {})' "$f" > "$f.tmp" && chmod 600 "$f.tmp" && mv "$f.tmp" "$f"
+done < <("$HOME/.local/bin/relais_config.py" dossiers)

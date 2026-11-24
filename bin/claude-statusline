@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Barre d'état Claude Code commune. Ex. : Pro (travail) · Opus 5.5 · 50/20 | Perso 12/30
+# 50/20 = % utilisés de la fenêtre de 5 h / de la semaine. ⚠ à partir de 90 %.
+# shellcheck source=bin/claude-usage-lib.sh
+. "$HOME/.local/bin/claude-usage-lib.sh"
+input=$(command cat)
+read -r nom compte <<<"$(cu_nom "$CLAUDE_CONFIG_DIR")"
+mkdir -p "$CU_DIR"
+if jq -e '.rate_limits' <<<"$input" >/dev/null 2>&1 && [ "$nom" != "?" ]; then
+  jq -c --argjson ts "$(date +%s)" '{five:.rate_limits.five_hour.used_percentage, five_reset:.rate_limits.five_hour.resets_at,
+     week:.rate_limits.seven_day.used_percentage, week_reset:.rate_limits.seven_day.resets_at, ts:$ts}' <<<"$input" \
+     > "$CU_DIR/$nom.json.tmp" && mv "$CU_DIR/$nom.json.tmp" "$CU_DIR/$nom.json"
+fi
+fmt() { local s w; read -r s w _ <<<"$(cu_lire "$1")"; local alerte=""
+  for v in $s $w; do [[ $v =~ ^[0-9]+$ ]] && (( v >= CU_SEUIL )) && alerte=" ⚠"; done; echo "$s/$w$alerte"; }
+modele=$(jq -r '.model.display_name // "?"' <<<"$input")
+autre=$(cu_autre "$nom")
+printf '%s (%s) · %s · %s | %s %s' "$nom" "$compte" "$modele" "$(fmt "$nom")" "$autre" "$(fmt "$autre")"

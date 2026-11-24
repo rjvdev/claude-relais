@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Ancien point d'entrée du hook, conservé : tout passe par claude-relais-ctl hook.
+exec "$HOME/.local/bin/claude-relais-ctl" hook

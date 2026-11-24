@@ -1,0 +1,4 @@
+#!/bin/sh
+# Lance Claude Desktop sur le profil du compte actif de claude-relais (un dossier de données par compte).
+# Si Claude Desktop est déjà ouvert, transmet à l'instance ouverte (lien claude://, clic sur le dock).
+exec "$HOME/.local/bin/claude-relais-ctl" desktop "$@"

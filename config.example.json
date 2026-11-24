@@ -1,0 +1,40 @@
+{
+  "_comment": "Copy to ~/.config/claude-relais/config.json and adapt. Every Claude Code config dir must be logged in (claude /login with CLAUDE_CONFIG_DIR set).",
+  "comptes": [
+    {
+      "nom": "Perso",
+      "signature": "PER",
+      "libelle": "personal",
+      "config": "~/.claude",
+      "desktop": "~/.config/Claude"
+    },
+    {
+      "nom": "Pro",
+      "signature": "PRO",
+      "libelle": "work",
+      "config": "~/.claude-pro",
+      "desktop": "~/.config/Claude-Pro"
+    }
+  ],
+  "navigateurs": [
+    {
+      "nom": "Chrome",
+      "profil": "~/.config/google-chrome"
+    },
+    {
+      "nom": "Chrome work",
+      "profil": "~/.config/chrome-work"
+    }
+  ],
+  "interdits": {
+    "Pro": [
+      "~/projects/side-business"
+    ]
+  },
+  "handoff": "~/work/HANDOFF.md",
+  "memoire": {
+    "consignes": "No customer data. No personal projects with the Pro account.",
+    "exemples_projet": "e.g. my-app, infra, workstation",
+    "exemples_sujet": "profile, preferences, workstation, my-app…"
+  }
+}

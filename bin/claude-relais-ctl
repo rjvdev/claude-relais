@@ -1,0 +1,870 @@
+#!/usr/bin/python3 -I
+"""Moteur de Relais (claude-relais) : deux comptes Claude, une configuration Claude Code partagée.
+Comptes, navigateurs, dossiers interdits : ~/.config/claude-relais/config.json (voir config.example.json).
+
+Sous-commandes :
+  status [--json]             état : compte actif, usage, sessions en cours, navigateurs
+  basculer [<compte>]         compte actif → l'autre (ou celui donné), passation de chaque session
+  auto on|off                 bascule automatique à 90 %
+  navigateur <nom> <compte>   déclare le compte connecté sur claude.ai dans un navigateur sans extension (<compte> ou aucun)
+  sonder [<compte>...]        mesure l'usage réel (petite requête, modèle léger) et met le cache à jour
+  choisir [--eviter Nom]      dossier de config à utiliser (« - » = ~/.claude) ; utilisé par claude-relais
+  hook                        hook Claude Code (SessionStart, UserPromptSubmit, Stop), JSON sur l'entrée standard
+  desktop [args]              lance Claude Desktop sur le profil du compte actif (lanceur claude-desktop-relais)
+  desktop-relancer <compte>   attend la fin des réponses de Claude Desktop puis le relance sur ce compte (lancé par basculer)
+  vscode-plan --hote <pid>    conversations du panneau VS Code de cette fenêtre à rouvrir sur le compte actif (extension VS Code)
+  nm                          hôte de messagerie native de l'extension navigateur (lancé par Chrome / Opera, via claude-relais-nm)
+"""
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def _module(nom):
+    """Charge un module voisin (le script tourne en python3 -I : son dossier n'est pas dans sys.path)."""
+    import importlib.util
+    chemin = Path(__file__).resolve().parent / f"{nom}.py"
+    spec = importlib.util.spec_from_file_location(nom, chemin)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+cfg = _module("relais_config")
+HOME = Path.home()
+CONFIGS = [cfg.dossier(c) for c in cfg.comptes()]      # "" = ~/.claude (CLAUDE_CONFIG_DIR absent)
+NOMS = cfg.noms()
+SEUIL = int(os.environ.get("CU_SEUIL", "90"))
+USAGE_DIR = Path(os.environ.get("CU_DIR", HOME / ".cache/claude-usage"))
+RUN_DIR = HOME / ".cache/claude-relais"
+SESS_DIR = RUN_DIR / "sessions"
+DEMANDE = RUN_DIR / "bascule.json"
+ETAT = HOME / ".config/claude-relais/etat.json"
+VSCODE = HOME / ".config/Code/User/settings.json"
+NAVIGATEURS = ["Claude Desktop"] + [n["nom"] for n in cfg.navigateurs()]
+# bascule automatique désactivée par défaut : à activer en connaissance des conditions d'utilisation d'Anthropic
+ETAT_DEFAUT = {"actif": NOMS[0], "auto": False, "navigateurs": {n: None for n in NAVIGATEURS}}
+NM_DIR = RUN_DIR / "navigateurs"                       # un fichier par navigateur relié par l'extension (hôte natif vivant)
+DESKTOP_BIN = "/usr/bin/claude-desktop"
+DESKTOP_REF = HOME / ".config/Claude"                  # profil par défaut, référence de la config MCP
+DESKTOP_LANCEUR = HOME / ".local/bin/claude-desktop-relais"
+DESKTOP_RELANCE = RUN_DIR / "desktop-relance.json"
+
+
+# ---------- fichiers ----------
+def lire_json(p, defaut=None):
+    try:
+        return json.loads(Path(p).read_text())
+    except (OSError, ValueError):
+        return defaut
+
+
+def ecrire_json(p, data):
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(f"{p.suffix}.{os.getpid()}.tmp")   # nom propre au processus : écritures parallèles sans collision
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    tmp.replace(p)
+
+
+def etat():
+    e = dict(ETAT_DEFAUT)
+    e.update(lire_json(ETAT, {}) or {})
+    e["navigateurs"] = {**ETAT_DEFAUT["navigateurs"], **(e.get("navigateurs") or {})}
+    if e.get("actif") not in NOMS:
+        e["actif"] = NOMS[0]
+    # Claude Desktop : un profil (dossier de données Electron) par compte, chacun connecté une fois
+    e["desktop"] = {n: cfg.desktop(n) for n in NOMS if cfg.desktop(n)}
+    e["interdits"] = cfg.interdits()
+    return e
+
+
+def ecrire_etat(e):
+    """etat.json ne garde que l'état d'exécution ; desktop et interdits viennent de config.json."""
+    ecrire_json(ETAT, {k: v for k, v in e.items() if k not in ("desktop", "interdits")})
+
+
+def interdit(nom, cwd):
+    """Vrai si le compte `nom` ne doit pas travailler dans `cwd` (ex. : projets perso interdits au compte pro)."""
+    if not cwd:
+        return False
+    cwd = os.path.realpath(os.path.expanduser(cwd))
+    for d in (etat().get("interdits") or {}).get(nom, []):
+        d = os.path.realpath(os.path.expanduser(d))
+        if cwd == d or cwd.startswith(d + os.sep):
+            return True
+    return False
+
+
+# ---------- comptes et usage ----------
+def compte_de_email(email):
+    return cfg.compte_de_email(email)
+
+
+def compte_courant():
+    """Compte de la session qui appelle (hook) : email fourni par Claude Desktop, sinon dossier de config."""
+    email = os.environ.get("CLAUDE_CODE_USER_EMAIL", "")
+    return compte_de_email(email)[0] if email else compte_de_config(os.environ.get("CLAUDE_CONFIG_DIR", ""))[0]
+
+
+def compte_de_config(dossier):
+    """dossier = "" (~/.claude) ou chemin → (Nom, libellé)."""
+    return cfg.compte_de_config(dossier)
+
+
+def config_de_compte(nom):
+    return cfg.dossier_de_compte(nom)
+
+
+def usage(nom):
+    d = lire_json(USAGE_DIR / f"{nom}.json")
+    if not d:
+        return {"five": None, "week": None, "age_min": None}
+    now = time.time()
+
+    def p(v, r):
+        if v is None:
+            return None
+        return 0 if (r is not None and r < now) else round(v)
+
+    return {"five": p(d.get("five"), d.get("five_reset")), "week": p(d.get("week"), d.get("week_reset")),
+            "age_min": int((now - d.get("ts", now)) // 60)}
+
+
+def usage_max(nom):
+    u = usage(nom)
+    return max(u["five"] or 0, u["week"] or 0)
+
+
+def autre(nom):
+    return cfg.autre(nom)
+
+
+# ---------- processus ----------
+def _lire(p, f):
+    try:
+        return Path(f"/proc/{p}/{f}").read_bytes()
+    except OSError:
+        return b""
+
+
+def _exe(p):
+    try:
+        return os.readlink(f"/proc/{p}/exe")
+    except OSError:
+        return ""
+
+
+def _est_claude(exe):
+    return ("/share/claude/versions/" in exe or exe.endswith("native-binary/claude")
+            or ("/.config/Claude/claude-code/" in exe and exe.endswith("/claude")))
+
+
+def _ppid(p):
+    s = _lire(p, "stat").decode(errors="replace")
+    try:
+        return int(s.rsplit(")", 1)[1].split()[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def _env(p):
+    out = {}
+    for kv in _lire(p, "environ").split(b"\0"):
+        k, _, v = kv.partition(b"=")
+        if k in (b"CLAUDE_CONFIG_DIR", b"CLAUDE_RELAIS_DIR", b"CLAUDE_CODE_USER_EMAIL"):
+            out[k.decode()] = v.decode(errors="replace")
+    return out
+
+
+def pid_claude_ancetre(p=None):
+    """Premier ancêtre (ou soi) qui est un processus Claude Code."""
+    p = p or os.getpid()
+    for _ in range(12):
+        if p <= 1:
+            return None
+        if _est_claude(_exe(p)):
+            return p
+        p = _ppid(p)
+    return None
+
+
+def sessions():
+    if os.environ.get("CLAUDE_RELAIS_TEST"):
+        return []                                       # tests : ne jamais toucher aux vrais processus
+    out = []
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        p = int(d.name)
+        exe = _exe(p)
+        if not _est_claude(exe) or _est_claude(_exe(_ppid(p))):
+            continue                                   # pas Claude, ou sous-processus d'un Claude
+        cmd = _lire(p, "cmdline").split(b"\0")
+        env = _env(p)
+        if env.get("CLAUDE_CODE_USER_EMAIL"):
+            nom, _ = compte_de_email(env["CLAUDE_CODE_USER_EMAIL"])
+        else:
+            nom, _ = compte_de_config(env.get("CLAUDE_CONFIG_DIR", ""))
+        chaine, q = [], _ppid(p)
+        for _ in range(8):
+            if q <= 1:
+                break
+            chaine.append(os.path.basename(_exe(q)))
+            q = _ppid(q)
+        if "/.config/Claude/claude-code/" in exe:
+            lieu = "Claude Desktop (Code)"
+        elif b"--chrome-native-host" in cmd:
+            lieu = "Chrome (extension)"
+        elif exe.endswith("native-binary/claude"):
+            lieu = "VS Code (panneau)"
+        elif "code" in chaine:
+            lieu = "VS Code (terminal)"
+        else:
+            lieu = "Terminal"
+        info = lire_json(SESS_DIR / f"{p}.json", {}) or {}
+        try:
+            cwd = os.readlink(f"/proc/{p}/cwd")
+        except OSError:
+            cwd = ""
+        out.append({"pid": p, "lieu": lieu, "cwd": cwd.replace(str(HOME), "~", 1), "cwd_abs": cwd, "compte": nom,
+                    "relais": bool(env.get("CLAUDE_RELAIS_DIR")), "relais_dir": env.get("CLAUDE_RELAIS_DIR"),
+                    "occupe": info.get("occupe"), "session_id": info.get("session_id"), "en_cours": info.get("en_cours")})
+    # ménage des fichiers de sessions terminées
+    vivants = {s["pid"] for s in out}
+    for f in SESS_DIR.glob("*.json"):
+        if f.stem.isdigit() and int(f.stem) not in vivants:
+            f.unlink(missing_ok=True)
+    return sorted(out, key=lambda s: (s["lieu"], s["pid"]))
+
+
+
+def applis_ouvertes():
+    """Applications où claude.ai peut tourner, ouvertes en ce moment (processus principal seulement)."""
+    ouvertes = set()
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        p = int(d.name)
+        exe = _exe(p)
+        if not exe or _exe(_ppid(p)) == exe:
+            continue
+        if exe.endswith("/claude-desktop"):
+            ouvertes.add("Claude Desktop")
+        else:
+            nav = cfg.navigateur_de_processus(exe, _lire(p, "cmdline"))
+            if nav:
+                ouvertes.add(nav)
+    return ouvertes
+
+def _vivant(pid):
+    return bool(pid) and Path(f"/proc/{pid}").exists()
+
+
+def _descend_de(p, ancetre):
+    for _ in range(8):
+        if p <= 1:
+            return False
+        if p == ancetre:
+            return True
+        p = _ppid(p)
+    return False
+
+
+# ---------- Claude Desktop : un profil par compte ----------
+def _chemin(d):
+    return os.path.realpath(os.path.expanduser(str(d)))
+
+
+def desktop_processus():
+    """(pid, profil) du processus principal de Claude Desktop, ou (None, None)."""
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        p = int(d.name)
+        exe = _exe(p)
+        if not exe.endswith("/claude-desktop") or _exe(_ppid(p)) == exe:
+            continue
+        # Chromium réécrit sa ligne de commande en une seule chaîne (arguments séparés par des espaces)
+        cmd = _lire(p, "cmdline").replace(b"\0", b" ")
+        if re.search(rb"(^|\s)--type=", cmd):
+            continue
+        m = re.search(rb"(?:^|\s)--user-data-dir=(\S+)", cmd)
+        return p, (m.group(1).decode(errors="replace") if m else str(DESKTOP_REF))
+    return None, None
+
+
+def desktop_compte_de_profil(prof):
+    for nom, d in etat()["desktop"].items():
+        if _chemin(d) == _chemin(prof):
+            return nom
+    return "?"
+
+
+def desktop_sync_mcp(dest):
+    """Recopie les serveurs MCP du profil de référence dans un autre profil (le reste de sa config est gardé)."""
+    ref = lire_json(DESKTOP_REF / "claude_desktop_config.json", {}) or {}
+    if "mcpServers" not in ref:
+        return
+    f = Path(dest) / "claude_desktop_config.json"
+    d = lire_json(f, {}) if f.exists() else {}
+    if d is None:
+        return                                          # fichier illisible : on n'y touche pas
+    if d.get("mcpServers") != ref["mcpServers"]:
+        d["mcpServers"] = ref["mcpServers"]
+        ecrire_json(f, d)
+
+
+def desktop_lancer(args):
+    """Lanceur : profil du compte actif, ou celui de l'instance déjà ouverte (lien claude://, clic sur le dock)."""
+    pid, prof = desktop_processus()
+    if not pid:
+        prof = os.path.expanduser(etat()["desktop"].get(etat()["actif"]) or str(DESKTOP_REF))
+    argv = [DESKTOP_BIN]
+    if _chemin(prof) != _chemin(DESKTOP_REF):
+        Path(prof).mkdir(parents=True, exist_ok=True)
+        desktop_sync_mcp(prof)
+        argv.append(f"--user-data-dir={prof}")
+    os.execv(DESKTOP_BIN, argv + list(args))
+
+
+def desktop_relancer(cible):
+    """Attend que les sessions Code de Claude Desktop aient fini (passation comprise), puis relance l'appli sur `cible`."""
+    moi = os.getpid()
+    ecrire_json(DESKTOP_RELANCE, {"pid": moi, "cible": cible, "depuis": time.strftime("%H:%M:%S")})
+    fin = time.time() + 2 * 3600
+    try:
+        while time.time() < fin:
+            if (lire_json(DESKTOP_RELANCE, {}) or {}).get("pid") != moi or etat()["actif"] != cible:
+                return 0                                # remplacé par une bascule plus récente
+            pid, prof = desktop_processus()
+            if not pid or desktop_compte_de_profil(prof) == cible:
+                return 0                                # fermé entre-temps, ou déjà sur le bon compte
+            if not [s for s in sessions() if s["lieu"] == "Claude Desktop (Code)" and (s["occupe"] or s["en_cours"])]:
+                os.kill(pid, signal.SIGTERM)            # Electron : SIGTERM = fermeture propre de l'appli
+                for _ in range(60):
+                    if not _vivant(pid):
+                        break
+                    time.sleep(0.5)
+                if _vivant(pid):
+                    notifier("Claude Desktop ne se ferme pas", f"Ferme-le à la main : il repartira sur {cible}.")
+                    return 1
+                time.sleep(1)
+                subprocess.Popen([str(DESKTOP_LANCEUR)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+                prof_cible = Path(os.path.expanduser(etat()["desktop"].get(cible, "")))
+                notifier(f"Claude Desktop relancé sur {cible}",
+                         "Première fois sur ce profil : connecte-toi avec ce compte." if not (prof_cible / "Cookies").exists() else "")
+                return 0
+            time.sleep(5)
+        notifier("Claude Desktop pas relancé", "Une session Code y travaille depuis 2 h : relance-le à la main.")
+        return 1
+    finally:
+        if (lire_json(DESKTOP_RELANCE, {}) or {}).get("pid") == moi:
+            DESKTOP_RELANCE.unlink(missing_ok=True)
+
+
+# ---------- panneau VS Code : conversations à rouvrir (extension claude-relais de VS Code) ----------
+def titre_session(sid):
+    """Titre affiché dans l'onglet : dernier titre donné par l'utilisateur, sinon dernier titre automatique."""
+    for f in (HOME / ".claude/projects").glob(f"*/{sid}.jsonl"):
+        perso = auto = None
+        try:
+            with open(f, "rb") as fh:
+                for ligne in fh:
+                    if b'"custom-title"' not in ligne and b'"ai-title"' not in ligne:
+                        continue
+                    try:
+                        d = json.loads(ligne)
+                    except ValueError:
+                        continue
+                    if d.get("type") == "custom-title" and d.get("customTitle"):
+                        perso = d["customTitle"]
+                    elif d.get("type") == "ai-title" and d.get("aiTitle"):
+                        auto = d["aiTitle"]
+        except OSError:
+            continue
+        return perso or auto
+    return None
+
+
+def transcription(sid):
+    return next((HOME / ".claude/projects").glob(f"*/{sid}.jsonl"), None)
+
+
+def vscode_plan(hote):
+    """Conversations du panneau de cette fenêtre (hôte d'extensions `hote`) restées sur l'autre compte.
+    `vide` : aucun message encore (pas de transcription) ; on la remplace par une nouvelle conversation.
+    `titres` / `sans_titre` : toutes les conversations de la fenêtre, pour retrouver l'onglet d'une conversation vide."""
+    cible = etat()["actif"]
+    out, titres, sans_titre = [], [], 0
+    for s in sessions():
+        if s["lieu"] != "VS Code (panneau)" or not _descend_de(s["pid"], hote):
+            continue
+        titre = titre_session(s["session_id"]) if s["session_id"] else None
+        if titre:
+            titres.append(titre)
+        else:
+            sans_titre += 1
+        if s["compte"] in (cible, "?") or not s["session_id"] or interdit(cible, s["cwd_abs"]):
+            continue
+        out.append({"pid": s["pid"], "session_id": s["session_id"], "compte": s["compte"], "cwd": s["cwd"],
+                    "titre": titre, "vide": transcription(s["session_id"]) is None, "occupe": bool(s["occupe"]),
+                    "pret": s["occupe"] is False and not s["en_cours"]})
+    return {"actif": cible, "sessions": out, "titres": titres, "sans_titre": sans_titre}
+
+
+# ---------- navigateurs : hôte de messagerie native de l'extension ----------
+def nm_navigateur():
+    p = os.getppid()
+    for _ in range(6):
+        if p <= 1:
+            break
+        nav = cfg.navigateur_de_processus(_exe(p), _lire(p, "cmdline"))
+        if nav:
+            return nav
+        p = _ppid(p)
+    return None
+
+
+def nm_orgs():
+    """Organisation claude.ai (cookie lastActiveOrg) → compte, d'après le compte connecté dans chaque config."""
+    out = {}
+    for c in cfg.comptes():
+        d = cfg.dossier(c)
+        if cfg.email_de_dossier(d) and cfg.org_de_dossier(d):
+            out[cfg.org_de_dossier(d)] = c["nom"]
+    return out
+
+
+def nm_cle():
+    """Clé de chiffrement du coffre de l'extension, gardée dans le trousseau (jamais dans un fichier)."""
+    attrs = ["service", "claude-relais-navigateurs"]
+    try:
+        cle = subprocess.run(["secret-tool", "lookup", *attrs], capture_output=True, text=True, timeout=10).stdout.strip()
+        if not cle:
+            import base64
+            cle = base64.b64encode(os.urandom(32)).decode()
+            r = subprocess.run(["secret-tool", "store", "--label=claude-relais : coffre des navigateurs", *attrs],
+                               input=cle, capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                return None
+        return cle
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def nm():
+    """Messagerie native (Chrome, Opera) : 4 octets de longueur puis JSON, sur stdin / stdout. Rien d'autre sur stdout."""
+    import threading
+    verrou = threading.Lock()
+    nom = nm_navigateur() or "?"
+    fichier = NM_DIR / f"{nom}.json"
+
+    def envoyer(msg):
+        b = json.dumps(msg, ensure_ascii=False).encode()
+        with verrou:
+            sys.stdout.buffer.write(len(b).to_bytes(4, "little") + b)
+            sys.stdout.buffer.flush()
+
+    def lire():
+        h = sys.stdin.buffer.read(4)
+        if len(h) < 4:
+            return None
+        return json.loads(sys.stdin.buffer.read(int.from_bytes(h, "little")))
+
+    info = {"pid": os.getpid(), "compte": None, "ts": time.time()}
+    ecrire_json(fichier, info)
+    actif = etat()["actif"]
+    envoyer({"type": "etat", "navigateur": nom, "actif": actif, "comptes": NOMS, "orgs": nm_orgs(), "cle": nm_cle()})
+
+    def surveiller():
+        nonlocal actif
+        while True:
+            time.sleep(1)
+            a = etat()["actif"]
+            if a != actif:
+                actif = a
+                envoyer({"type": "actif", "actif": a})
+
+    threading.Thread(target=surveiller, daemon=True).start()
+    try:
+        while True:
+            m = lire()
+            if m is None:
+                break
+            if m.get("type") == "compte" and nom in NAVIGATEURS:
+                c = m.get("compte") if m.get("compte") in NOMS else None
+                info.update(compte=c, ts=time.time())
+                ecrire_json(fichier, info)
+                e = etat()
+                if c and e["navigateurs"].get(nom) != c:
+                    e["navigateurs"][nom] = c
+                    ecrire_etat(e)
+            elif m.get("type") == "basculer" and m.get("cible") in NOMS:
+                subprocess.Popen([str(Path(__file__).resolve()), "basculer", m["cible"]], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    finally:
+        if (lire_json(fichier, {}) or {}).get("pid") == os.getpid():
+            fichier.unlink(missing_ok=True)
+    return 0
+
+
+def navigateurs_relies():
+    """{navigateur: compte connecté sur claude.ai} pour les navigateurs dont l'extension est reliée en ce moment."""
+    out = {}
+    for f in NM_DIR.glob("*.json"):
+        d = lire_json(f, {}) or {}
+        if _vivant(d.get("pid")):
+            out[f.stem] = d.get("compte")
+        else:
+            f.unlink(missing_ok=True)
+    return out
+
+
+# ---------- VS Code ----------
+def vscode_compte():
+    d = lire_json(VSCODE, {}) or {}
+    for v in d.get("claudeCode.environmentVariables", []):
+        if v.get("name") == "CLAUDE_CONFIG_DIR":
+            return compte_de_config(v.get("value", ""))[0]
+    return compte_de_config("")[0]
+
+
+def vscode_regler(nom):
+    """Fixe le compte du panneau VS Code (prend effet au rechargement de la fenêtre)."""
+    dossier = config_de_compte(nom)
+    if dossier is None or not VSCODE.exists():
+        return False
+    d = lire_json(VSCODE)
+    if d is None:
+        return False                                   # JSON avec commentaires : on ne touche pas
+    bak = VSCODE.with_name(f"settings.json.bak-{time.strftime('%Y-%m-%d')}")
+    if not bak.exists():
+        bak.write_bytes(VSCODE.read_bytes())
+    env = [v for v in d.get("claudeCode.environmentVariables", []) if v.get("name") != "CLAUDE_CONFIG_DIR"]
+    if dossier:
+        env.append({"name": "CLAUDE_CONFIG_DIR", "value": dossier})
+    if env:
+        d["claudeCode.environmentVariables"] = env
+    else:
+        d.pop("claudeCode.environmentVariables", None)
+    ecrire_json(VSCODE, d)
+    return True
+
+
+# ---------- bascule ----------
+def notifier(titre, texte):
+    if os.environ.get("CLAUDE_RELAIS_TEST"):
+        return
+    try:
+        subprocess.Popen(["notify-send", "-a", "Relais", titre, texte], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def demander_bascule_relais(s, mode):
+    """Écrit la demande pour claude-relais puis termine la session (mode : faite | a-faire)."""
+    d = Path(s["relais_dir"])
+    if not d.is_dir():
+        return False
+    (d / "bascule").write_text(f"{s.get('session_id') or '-'} {s['compte']} {mode}\n")
+    try:
+        os.kill(s["pid"], signal.SIGTERM)
+    except OSError:
+        return False
+    return True
+
+
+def basculer(cible=None, silencieux=False, motif="manuel"):
+    e = etat()
+    cible = cible or autre(e["actif"])
+    if config_de_compte(cible) is None:
+        print(f"{cible} n'est connecté dans aucune configuration", file=sys.stderr)
+        return 1
+    e["actif"] = cible
+    ecrire_etat(e)
+    ecrire_json(DEMANDE, {"cible": cible, "ts": time.time(), "motif": motif,
+                          "heure": time.strftime("%Y-%m-%d %H:%M:%S")})
+    bilan = []
+    for s in sessions():
+        if s["compte"] == cible or s["lieu"] == "Chrome (extension)":
+            continue
+        if s["lieu"] == "Claude Desktop (Code)":
+            continue                                    # traité plus bas : relance de l'appli sur le profil de `cible`
+        if interdit(cible, s["cwd_abs"]):
+            bilan.append(f"{s['lieu']} {s['cwd']} : reste sur {s['compte']} (dossier interdit à {cible})")
+            continue
+        if s["lieu"] == "VS Code (panneau)":
+            bilan.append(f"VS Code {s['cwd']} : " + ("passation en fin de réponse, puis " if s["occupe"] else "")
+                         + f"conversation rouverte sur {cible} (extension claude-relais)")
+        elif s["relais"] and not s["occupe"]:
+            ok = demander_bascule_relais(s, "a-faire")
+            bilan.append(f"{s['lieu']} {s['cwd']} : {'relancée sur ' + cible if ok else 'échec'}")
+        elif s["occupe"]:
+            bilan.append(f"{s['lieu']} {s['cwd']} : passation en fin de réponse")
+        else:
+            bilan.append(f"{s['lieu']} {s['cwd']} : inactive, à relancer à la main")
+    if vscode_compte() != cible and vscode_regler(cible):
+        bilan.append(f"Panneau VS Code : nouvelles conversations sur {cible}")
+    dpid, dprof = desktop_processus()
+    if dpid and desktop_compte_de_profil(dprof) != cible and not os.environ.get("CLAUDE_RELAIS_TEST"):
+        subprocess.Popen([str(Path(__file__).resolve()), "desktop-relancer", cible], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        bilan.append(f"Claude Desktop : relancé sur {cible} dès la fin des réponses en cours")
+    for nav in navigateurs_relies():
+        bilan.append(f"{nav} : claude.ai passe sur {cible} (extension)")
+    notifier(f"Relais : bascule sur {cible}", "\n".join(dict.fromkeys(bilan)) or "Aucune session à basculer")
+    if not silencieux:
+        print("\n".join([f"Compte actif : {cible}"] + list(dict.fromkeys(bilan))))
+    return 0
+
+
+# ---------- choix du compte (claude-relais) ----------
+def choisir(eviter=None):
+    e = etat()
+    dem = lire_json(DEMANDE, {}) or {}
+    ici = os.getcwd()
+    candidats = [n for n in NOMS if config_de_compte(n) is not None and n != eviter and not interdit(n, ici)]
+    if not candidats:
+        return None
+    if dem.get("cible") in candidats and time.time() - dem.get("ts", 0) < 3600:
+        prefere = dem["cible"]
+    else:
+        prefere = e["actif"] if e["actif"] in candidats else candidats[0]
+    if e["auto"] and usage_max(prefere) >= SEUIL:
+        libres = [n for n in candidats if usage_max(n) < SEUIL]
+        if libres:
+            prefere = min(libres, key=usage_max)
+    return config_de_compte(prefere)
+
+
+# ---------- hook ----------
+CONSIGNE_PASSATION = (
+    "Bascule de compte Claude demandée ({de} → {vers}{raison}). Avant de t'arrêter, fais la passation : "
+    "mets à jour le HANDOFF.md concerné selon le protocole du CLAUDE.md du projet (État actuel, Dernières actions, "
+    "Prochaine étape, Décisions prises, Points bloquants), assez précis pour que {vers} reprenne sans poser de question. "
+    "S'il n'y a pas de HANDOFF.md pour ce dossier, résume la passation dans ta réponse. "
+    "Dans la mémoire commune : ajoute au journal du jour ce que tu as fait (memoire_journal_ajouter) et laisse à {vers} "
+    "un message court avec ce qu'il doit savoir pour continuer (memoire_message). Puis termine ta réponse."
+)
+
+
+def hook():
+    try:
+        h = json.load(sys.stdin)
+    except ValueError:
+        return 0
+    ev = h.get("hook_event_name", "")
+    pid = int(os.environ.get("CLAUDE_RELAIS_PID_TEST", "0")) or pid_claude_ancetre()
+    if not pid:
+        return 0
+    f = SESS_DIR / f"{pid}.json"
+    info = lire_json(f, {}) or {}
+    info.update({"session_id": h.get("session_id"), "cwd": h.get("cwd"), "ts": time.time()})
+    moi_ici = compte_courant()
+    contexte = []
+    if interdit(moi_ici, h.get("cwd")):
+        msg = (f"Dossier interdit au compte {moi_ici} : ce travail se fait uniquement avec "
+               f"{autre(moi_ici)} (claude-relais, ou panneau VS Code basculé sur {autre(moi_ici)}).")
+        if ev == "UserPromptSubmit":
+            print(json.dumps({"decision": "block", "reason": msg}, ensure_ascii=False))
+            return 0
+        contexte.append(msg + " Ne fais rien dans ce dossier et demande à l'utilisateur de changer de compte.")
+    if ev == "SessionStart" and moi_ici in NOMS:
+        # reprise de la mémoire commune : complète au démarrage, nouveaux messages seulement après une reprise de session
+        args = [str(HOME / ".local/bin/memoire"), "reprise", "--pour", moi_ici]
+        if h.get("source") == "resume":
+            args.append("--messages")
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=10).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            r = ""
+        if r:
+            contexte.append(f"Tu es {moi_ici} ({cfg.signature(moi_ici)}).\n" + r)
+    if ev == "SessionStart" and contexte:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "\n\n".join(contexte)}},
+                         ensure_ascii=False))
+    if ev in ("SessionStart", "UserPromptSubmit"):
+        info["occupe"] = ev == "UserPromptSubmit"
+        ecrire_json(f, info)
+        return 0
+    if ev != "Stop":
+        return 0
+    info["occupe"] = False
+    moi = compte_courant()
+    e = etat()
+    dem = lire_json(DEMANDE, {}) or {}
+    cible = cle = None
+    raison = ""
+    if moi != "?" and dem.get("cible") and dem["cible"] != moi and time.time() - dem.get("ts", 0) < 3600:
+        cible, cle = dem["cible"], f"m{dem['ts']}"
+    elif moi != "?" and e["auto"] and usage_max(moi) >= SEUIL and usage_max(autre(moi)) < SEUIL:
+        cible, cle = autre(moi), f"a{moi}{int(time.time() // 3600)}"
+        raison = f", {moi} à {usage_max(moi)} %"
+    if cible and interdit(cible, h.get("cwd")):
+        cible = None
+    if not cible or cle in (info.get("fait"), info.get("fait_demande")):
+        ecrire_json(f, info)
+        return 0
+    if cle != info.get("en_cours"):
+        # 1er arrêt : on demande la passation, la session continue
+        info["en_cours"] = cle
+        ecrire_json(f, info)
+        print(json.dumps({"decision": "block", "reason": CONSIGNE_PASSATION.format(de=moi, vers=cible, raison=raison)},
+                         ensure_ascii=False))
+        return 0
+    # 2e arrêt : passation faite → bascule globale si elle vient de l'automatique, puis relance (relais) ou avis
+    info["fait"], info["en_cours"] = cle, None
+    if cle.startswith("a") and e.get("actif") != cible:
+        basculer(cible, silencieux=True, motif=f"auto : {moi} à {usage_max(moi)} %")   # compte actif, VS Code, autres sessions
+        info["fait_demande"] = f"m{(lire_json(DEMANDE, {}) or {}).get('ts')}"
+    ecrire_json(f, info)
+    relais_dir = os.environ.get("CLAUDE_RELAIS_DIR")
+    if relais_dir and Path(relais_dir).is_dir():
+        Path(relais_dir, "bascule").write_text(f"{h.get('session_id') or '-'} {moi} faite\n")
+        subprocess.Popen(["setsid", "sh", "-c", f"sleep 2; kill -TERM {pid}"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    else:
+        notifier(f"Relais : passation faite ({moi} → {cible})",
+                 f"Session hors relais : ouvre une nouvelle conversation (VS Code) ou relance claude (terminal), elle partira sur {cible}.")
+    return 0
+
+
+
+# ---------- sondage de l'usage (petite requête, modèle léger) ----------
+def sonder(noms=None):
+    """Fait une requête minimale par compte et lit l'usage dans le flux JSON de Claude Code."""
+    res = {}
+    for nom in noms or NOMS:
+        dossier = config_de_compte(nom)
+        if dossier is None:
+            continue
+        env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_CONFIG_DIR", "CLAUDE_RELAIS_DIR")}
+        if dossier:
+            env["CLAUDE_CONFIG_DIR"] = dossier
+        try:
+            out = subprocess.run([str(HOME / ".local/bin/claude"), "-p", "--model", "haiku", "--output-format", "stream-json",
+                                  "--verbose", "--max-turns", "1", "--no-session-persistence", "--setting-sources", "user",
+                                  "Réponds seulement : ok"], env=env, cwd=str(RUN_DIR), capture_output=True, text=True, timeout=120).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        for ligne in out.splitlines():
+            try:
+                ev = json.loads(ligne)
+            except ValueError:
+                continue
+            fen = ((ev.get("rate_limit_info") or {}).get("unifiedWindows")) if ev.get("type") == "rate_limit_event" else None
+            if not fen:
+                continue
+            f5, f7 = fen.get("five_hour") or {}, fen.get("seven_day") or {}
+            d = {"five": round((f5.get("utilization") or 0) * 100, 1), "five_reset": f5.get("resetsAt"),
+                 "week": round((f7.get("utilization") or 0) * 100, 1), "week_reset": f7.get("resetsAt"), "ts": time.time()}
+            ecrire_json(USAGE_DIR / f"{nom}.json", d)
+            res[nom] = d
+            break
+    return res
+
+# ---------- status ----------
+def status():
+    e = etat()
+    ouv = applis_ouvertes()
+    sess = sessions()
+    det = {}
+    for x in sess:
+        if x["lieu"] == "Claude Desktop (Code)" and x["compte"] != "?":
+            det["Claude Desktop"] = x["compte"]
+    _, dprof = desktop_processus()
+    if dprof and desktop_compte_de_profil(dprof) != "?":
+        det["Claude Desktop"] = desktop_compte_de_profil(dprof)
+    for nav, c in navigateurs_relies().items():
+        if c:
+            det[nav] = c
+    comptes = []
+    for c in CONFIGS:
+        nom, lib = compte_de_config(c)
+        comptes.append({"nom": nom, "compte": lib, "config": c or "~/.claude", **usage(nom)})
+    return {"actif": e["actif"], "auto": e["auto"], "seuil": SEUIL, "comptes": comptes,
+            "vscode": vscode_compte(), "sessions": sess,
+            "navigateurs": [{"nom": n, "compte": det.get(n) or e["navigateurs"].get(n), "detecte": n in det, "ouvert": n in ouv}
+                            for n in NAVIGATEURS],
+            "demande": lire_json(DEMANDE), "memoire": memoire_stats(), "handoff": cfg.handoff()}
+
+
+def memoire_stats():
+    try:
+        out = subprocess.run([str(HOME / ".local/bin/memoire"), "stats", "--json"], capture_output=True, text=True, timeout=10).stdout
+        return json.loads(out)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def fmt(v):
+    return "--" if v is None else str(v)
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    if cmd == "status":
+        st = status()
+        if "--json" in argv:
+            print(json.dumps(st, ensure_ascii=False))
+            return 0
+        print(f"Actif : {st['actif']}   bascule auto à {st['seuil']} % : {'oui' if st['auto'] else 'non'}   panneau VS Code : {st['vscode']}")
+        for c in st["comptes"]:
+            print(f"  {c['nom']:<6} ({c['compte']}, {c['config']})  {fmt(c['five'])}/{fmt(c['week'])}")
+        print("Sessions :")
+        for s in st["sessions"]:
+            etat_s = {True: "en cours", False: "inactive", None: "?"}[s["occupe"]]
+            print(f"  {s['lieu']:<20} {s['compte']:<6} {etat_s:<9} {'relais ' if s['relais'] else ''}{s['cwd']}")
+        d = st.get("demande") or {}
+        if d:
+            print(f"Dernière bascule : vers {d.get('cible')} le {d.get('heure', '?')} ({d.get('motif', 'motif inconnu')})")
+        print("Applis claude.ai :")
+        for n in st["navigateurs"]:
+            print(f"  {n['nom']:<14} {n['compte'] or '—':<6} {'détecté' if n['detecte'] else 'déclaré':<8} {'ouvert' if n['ouvert'] else 'fermé'}")
+        return 0
+    if cmd == "desktop":
+        return desktop_lancer(argv[2:])
+    if cmd == "desktop-relancer" and len(argv) > 2 and argv[2] in NOMS:
+        return desktop_relancer(argv[2])
+    if cmd == "vscode-plan" and "--hote" in argv:
+        print(json.dumps(vscode_plan(int(argv[argv.index("--hote") + 1])), ensure_ascii=False))
+        return 0
+    if cmd == "nm" or (len(argv) > 1 and argv[1].startswith("chrome-extension://")):
+        return nm()
+    if cmd == "basculer":
+        return basculer(argv[2] if len(argv) > 2 else None)
+    if cmd == "auto" and len(argv) > 2 and argv[2] in ("on", "off"):
+        e = etat(); e["auto"] = argv[2] == "on"; ecrire_etat(e)
+        return 0
+    if cmd == "navigateur" and len(argv) > 3 and argv[2] in NAVIGATEURS and argv[3] in NOMS + ["aucun"]:
+        e = etat(); e["navigateurs"][argv[2]] = None if argv[3] == "aucun" else argv[3]; ecrire_etat(e)
+        return 0
+    if cmd == "choisir":
+        ev = argv[argv.index("--eviter") + 1] if "--eviter" in argv else None
+        c = choisir(ev)
+        if c is None:
+            return 1
+        print(c or "-")
+        return 0
+    if cmd == "hook":
+        return hook()
+    if cmd == "memoire" and len(argv) > 3 and argv[2] in ("accepter", "refuser"):
+        return subprocess.run([str(HOME / ".local/bin/memoire"), argv[2], argv[3]]).returncode
+    if cmd == "sonder":
+        r = sonder(argv[2:] or None)
+        for n, d in r.items():
+            print(f"{n} {round(d['five'])}/{round(d['week'])}")
+        return 0 if r else 1
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

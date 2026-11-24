@@ -1,0 +1,13 @@
+# Build output
+applet/target/
+# Python
+__pycache__/
+*.pyc
+# Local, personal files (never published)
+CLAUDE.local.md
+README.local.md
+HANDOFF.md
+*.bak-*
+*.local.*
+.claude/
+logs/

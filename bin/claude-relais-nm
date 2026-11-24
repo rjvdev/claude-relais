@@ -1,0 +1,5 @@
+#!/bin/sh
+# Hôte de messagerie native de l'extension navigateur claude-relais (navigateurs Chromium déclarés dans config.json).
+# Lancé par le navigateur, jamais à la main. Ne reçoit jamais de cookie : il donne le compte actif,
+# la correspondance organisation → compte et la clé du coffre (trousseau), et note le compte connecté.
+exec "$HOME/.local/bin/claude-relais-ctl" nm "$@"
