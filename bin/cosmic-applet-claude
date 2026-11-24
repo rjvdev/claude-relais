@@ -1,0 +1,4 @@
+#!/bin/sh
+# Enveloppe lancée par le panneau COSMIC : journal de l'applet dans ~/.cache/claude-relais/applet.log
+mkdir -p "$HOME/.cache/claude-relais"
+CLAUDE_APPLET_LOG="${CLAUDE_APPLET_LOG:-warn}" exec "$HOME/.local/bin/cosmic-applet-claude-bin" "$@" 2>>"$HOME/.cache/claude-relais/applet.log"

@@ -1,0 +1,16 @@
+[Desktop Entry]
+Name=Claude
+Name[fr]=Claude
+Comment=Relais : compte Claude actif, usage, sessions en cours et bascule avec passation
+Type=Application
+Exec=cosmic-applet-claude
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;Claude;
+Icon=utilities-terminal-symbolic
+StartupNotify=true
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicShrinkable=true
+X-HostWaylandDisplay=true
+X-CosmicHoverPopup=Auto
