@@ -1,0 +1,632 @@
+#!/usr/bin/python3 -I
+"""Mémoire commune à tous les Claude du poste (les deux comptes de Relais ; terminal, VS Code, Claude Desktop).
+
+Journal en ajout seul : ~/.local/share/memoire-commune/journal.jsonl (rien n'y est jamais réécrit, sauf purge par l'utilisateur).
+Règle : un Claude lit, cherche, ajoute, corrige (nouvelle version) et DEMANDE une suppression ; seul l'utilisateur
+accepte ou refuse une suppression, ou purge définitivement une entrée.
+
+Trois espaces : GLOBAL (faits durables, versionnés), JOURNAL (ce que chaque Claude a fait, un fichier par jour),
+MESSAGES (de Claude à Claude, lus/non lus). Signatures : celle de chaque compte (config.json), UTI (utilisateur), suivies du lieu.
+Vues lisibles régénérées à chaque écriture : vues/global.md, vues/journal/AAAA-MM-JJ.md, vues/messages.md.
+
+Usage :
+  memoire aide                        cette aide
+  memoire mcp                         serveur MCP (stdio) pour les Claude
+  memoire reprise [--pour <compte>] [--messages] [--sans-marquer]   résumé de reprise (hook SessionStart)
+  memoire journal [AAAA-MM-JJ]        journal d'un jour (aujourd'hui par défaut)
+  memoire message <compte|tous> <texte>   (utilisateur)
+  memoire lister [sujet]              entrées actives
+  memoire chercher <texte>
+  memoire historique <id>
+  memoire ajouter <sujet> <texte>     (utilisateur)
+  memoire demandes                    demandes de suppression en attente
+  memoire accepter <id> | refuser <id>
+  memoire purger <id>                 efface définitivement l'entrée et ses versions du journal (sauvegarde avant)
+  memoire stats [--json]
+  memoire <commande d'extension>      commandes ajoutées par ~/.config/claude-relais/memoire_ext_*.py
+"""
+import fcntl
+import json
+import os
+import re
+import shutil
+import sys
+import time
+from pathlib import Path
+
+
+
+def _module(nom):
+    """Charge un module voisin (le script tourne en python3 -I : son dossier n'est pas dans sys.path)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(nom, Path(__file__).resolve().parent / f"{nom}.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+cfg = _module("relais_config")
+HOME = Path.home()
+DIR = Path(os.environ.get("MEMOIRE_DIR", HOME / ".local/share/memoire-commune"))
+JOURNAL = DIR / "journal.jsonl"
+SAUVEGARDES = DIR / "sauvegardes"
+VUES = DIR / "vues"
+TAILLE_MAX = 2000
+TAILLE_JOURNAL = 400
+TAILLE_MESSAGE = 1500
+VERSION = "2.0"
+TRIGRAMMES = {n: cfg.signature(n) for n in cfg.noms()}
+COMPTE_DE_TRIGRAMME = {**{t: n for n, t in TRIGRAMMES.items()}, "UTI": "utilisateur"}
+SEUIL_DOUBLON = 0.8                                    # similarité au-delà de laquelle un fait global est refusé (max actuel : 0,42)
+
+SECRETS = [
+    (r"sk-ant-[A-Za-z0-9_-]{10,}", "clé Anthropic"), (r"\bgh[pousr]_[A-Za-z0-9]{20,}", "jeton GitHub"),
+    (r"github_pat_[A-Za-z0-9_]{20,}", "jeton GitHub"), (r"\bglpat-[A-Za-z0-9_-]{15,}", "jeton GitLab"),
+    (r"\bxox[abprs]-[A-Za-z0-9-]{10,}", "jeton Slack"), (r"\bAKIA[0-9A-Z]{16}\b", "clé AWS"),
+    (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", "clé privée"), (r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}", "jeton JWT"),
+    (r"(?i)\b(password|passwd|mot de passe|mdp|secret|token|api[_ -]?key|apikey)\s*[:=]\s*\S{6,}", "mot de passe ou jeton"),
+]
+# données personnelles : adresses e-mail (sauf adresses techniques git@…, noreply) et numéros de téléphone
+EMAIL = re.compile(r"(?<![\w.+-])([\w.+-]+)@([\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,})\b")
+EMAIL_TECHNIQUES = ("git", "noreply", "no-reply")
+TELEPHONES = [re.compile(r"(?<![\w+])\+\d[\d ().-]{6,18}\d(?![\w])"),          # international : +261 34 12 345 67
+              re.compile(r"(?<![\w.:/-])0\d(?:[ .-]?\d){8}(?![\w.:/-])")]        # national à 10 chiffres : 06 12 34 56 78, 034 12 345 67
+
+
+# ---------- journal ----------
+def _verrou():
+    DIR.mkdir(parents=True, exist_ok=True)
+    f = open(DIR / ".verrou", "w")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
+def evenements():
+    if not JOURNAL.exists():
+        return []
+    out = []
+    for ligne in JOURNAL.read_text(encoding="utf-8").splitlines():
+        try:
+            out.append(json.loads(ligne))
+        except ValueError:
+            continue
+    return out
+
+
+def sauvegarde_du_jour():
+    if not JOURNAL.exists():
+        return
+    SAUVEGARDES.mkdir(parents=True, exist_ok=True)
+    cible = SAUVEGARDES / f"journal-{time.strftime('%Y-%m-%d')}.jsonl"
+    if not cible.exists():
+        shutil.copy2(JOURNAL, cible)
+
+
+def ajouter_evenement(ev):
+    """Ajoute un événement sous verrou ; attribue un id aux nouvelles entrées."""
+    with _verrou():
+        sauvegarde_du_jour()
+        evs = evenements()
+        if ev["type"] in ("ajout", "correction", "journal", "message"):
+            compteur = DIR / ".dernier_id"                 # jamais de réutilisation d'un numéro, même après purge
+            try:
+                dernier = int(compteur.read_text().strip())
+            except (OSError, ValueError):
+                dernier = 0
+            ev["id"] = max([dernier] + [e.get("id", 0) for e in evs if "id" in e]) + 1
+            compteur.write_text(str(ev["id"]))
+        ev["date"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(JOURNAL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        try:
+            regenerer_vues()
+        except OSError:
+            pass
+        return ev
+
+
+def etat():
+    """Rejoue le journal → {id: entrée} avec statut : active, remplacee, suppression_demandee, supprimee."""
+    entrees = {}
+    for e in evenements():
+        t = e["type"]
+        if t in ("ajout", "correction"):
+            entrees[e["id"]] = {"id": e["id"], "sujet": e.get("sujet", ""), "texte": e["texte"], "auteur": e.get("auteur", "?"),
+                                "date": e["date"], "statut": "active", "remplace": e.get("remplace"), "raison": e.get("raison")}
+            if t == "correction" and e.get("remplace") in entrees:
+                entrees[e["remplace"]]["statut"] = "remplacee"
+                entrees[e["remplace"]]["remplacee_par"] = e["id"]
+        elif t == "demande_suppression" and e.get("cible") in entrees:
+            x = entrees[e["cible"]]
+            if x["statut"] == "active":
+                x.update(statut="suppression_demandee", demande={"raison": e.get("raison"), "auteur": e.get("auteur"), "date": e["date"]})
+        elif t == "suppression_acceptee" and e.get("cible") in entrees:
+            entrees[e["cible"]]["statut"] = "supprimee"
+        elif t == "suppression_refusee" and e.get("cible") in entrees:
+            x = entrees[e["cible"]]
+            if x["statut"] == "suppression_demandee":
+                x["statut"] = "active"
+                x.pop("demande", None)
+    return entrees
+
+
+def visibles(sujet=None):
+    """Entrées lisibles par les Claude : actives et en attente de suppression (signalées)."""
+    out = [x for x in etat().values() if x["statut"] in ("active", "suppression_demandee")]
+    if sujet:
+        out = [x for x in out if x["sujet"].lower() == sujet.lower()]
+    return sorted(out, key=lambda x: (x["sujet"].lower(), x["id"]))
+
+
+# ---------- auteur ----------
+def compte_appelant():
+    """Nom du compte ou « ? » (email fourni par Claude Desktop à ses sessions, sinon dossier de config)."""
+    email = os.environ.get("CLAUDE_CODE_USER_EMAIL", "")
+    if not email:
+        dossier_cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
+        j = Path(dossier_cfg) / ".claude.json" if dossier_cfg else HOME / ".claude.json"
+        try:
+            email = (json.loads(j.read_text()).get("oauthAccount") or {}).get("emailAddress") or ""
+        except (OSError, ValueError):
+            email = ""
+    return cfg.compte_de_email(email)[0]
+
+
+def auteur():
+    def compte(email):
+        c = cfg.compte_de_email(email)[0]
+        return TRIGRAMMES.get(c, "???")
+    email = os.environ.get("CLAUDE_CODE_USER_EMAIL", "")
+    if not email:
+        dossier_cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
+        j = Path(dossier_cfg) / ".claude.json" if dossier_cfg else HOME / ".claude.json"
+        try:
+            email = (json.loads(j.read_text()).get("oauthAccount") or {}).get("emailAddress") or ""
+        except (OSError, ValueError):
+            email = ""
+    lieux = {"claude-vscode": "VS Code", "claude-desktop": "Claude Desktop (Code)", "cli": "terminal"}
+    ep = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "")
+    lieu = lieux.get(ep, ep or "Claude Desktop")
+    if os.environ.get("MEMOIRE_AUTEUR"):
+        return os.environ["MEMOIRE_AUTEUR"]
+    return f"{compte(email)}·{lieu}"
+
+
+# ---------- contrôles ----------
+def controler(texte, sujet="", maxi=TAILLE_MAX):
+    if not texte or not texte.strip():
+        return "texte vide"
+    if len(texte) > maxi:
+        return f"texte trop long ({len(texte)} caractères, maximum {maxi}) : faire plus court ou découper"
+    tout = f"{sujet}\n{texte}"
+    for motif, nom in SECRETS:
+        if re.search(motif, tout):
+            return f"refusé : le texte ressemble à un secret ({nom}). Aucun identifiant, jeton ni mot de passe dans la mémoire."
+    for m in EMAIL.finditer(tout):
+        if m.group(1).lower() not in EMAIL_TECHNIQUES and not m.group(2).lower().endswith("noreply.github.com"):
+            return "refusé : le texte contient une adresse e-mail (donnée personnelle). Écrire « adresse perso », « adresse pro » ou Person_1."
+    for motif in TELEPHONES:
+        for m in motif.finditer(tout):
+            if 8 <= sum(c.isdigit() for c in m.group(0)) <= 15:
+                return "refusé : le texte contient un numéro de téléphone (donnée personnelle). L'omettre ou écrire Person_1."
+    return None
+
+
+def _normaliser(t):
+    return re.sub(r"\W+", " ", t.lower()).strip()
+
+
+def fait_proche(texte):
+    """Fait global en vigueur le plus proche (similarité ≥ SEUIL_DOUBLON), sinon None → (ratio, entrée)."""
+    import difflib
+    cible, meilleur = _normaliser(texte), None
+    for x in visibles():
+        r = difflib.SequenceMatcher(None, cible, _normaliser(x["texte"])).ratio()
+        if r >= SEUIL_DOUBLON and (meilleur is None or r > meilleur[0]):
+            meilleur = (r, x)
+    return meilleur
+
+
+def compte_de_auteur(aut, defaut=None):
+    """La signature fait foi : « XXX·lieu » → compte de la signature XXX, quel que soit le compte qui importe."""
+    return COMPTE_DE_TRIGRAMME.get((aut or "").split("·")[0], defaut)
+
+
+def fmt(x, long=True):
+    marque = " [SUPPRESSION DEMANDÉE]" if x["statut"] == "suppression_demandee" else ""
+    tete = f"G{x['id']} [{x['sujet'] or 'divers'}] ({x['date'][:16]}, {x['auteur']}){marque}"
+    return f"{tete}\n{x['texte']}" if long else f"{tete} {x['texte'][:90]}"
+
+
+# ---------- journal du jour et messages ----------
+def journal_du(jour=None):
+    jour = jour or time.strftime("%Y-%m-%d")
+    return [e for e in evenements() if e["type"] == "journal" and e["date"].startswith(jour)]
+
+
+def jours_du_journal():
+    return sorted({e["date"][:10] for e in evenements() if e["type"] == "journal"})
+
+
+def messages(pour=None, non_lus=False):
+    evs = evenements()
+    lus = {}
+    for e in evs:
+        if e["type"] == "lu":
+            lus.setdefault(e["cible"], set()).add(e["par"])
+    out = []
+    for e in evs:
+        if e["type"] != "message":
+            continue
+        if pour and e.get("a") not in (pour, "tous"):
+            continue
+        if pour and compte_de_auteur(e.get("auteur"), e.get("de_compte")) == pour:
+            continue                                   # ses propres messages (d'après la signature)
+        e = dict(e, lu_par=sorted(lus.get(e["id"], set())))
+        if non_lus and pour in e["lu_par"]:
+            continue
+        out.append(e)
+    return out
+
+
+def marquer_lus(ids, par):
+    for i in ids:
+        ajouter_evenement({"type": "lu", "cible": i, "par": par})
+
+
+def ligne_journal(e):
+    projet = f" [{e['projet']}]" if e.get("projet") else ""
+    return f"{e['date'][11:16]} {e['auteur']}{projet} — {e['texte']}"
+
+
+def ligne_message(e):
+    return f"M{e['id']} {e['date'][5:16]} {e['auteur']} → {e['a']} : {e['texte']}"
+
+
+def reprise(pour, seulement_messages=False, marquer=True):
+    """Résumé compact pour démarrer une session sans décalage de connaissance."""
+    tri = TRIGRAMMES.get(pour, "?")
+    parties = []
+    if not seulement_messages:
+        g = visibles()
+        parties.append(f"# Mémoire commune — reprise pour {pour} ({tri}), {time.strftime('%Y-%m-%d %H:%M')}")
+        parties.append(f"## Global ({len(g)})\n" + ("\n".join(f"G{x['id']} [{x['sujet']}] {x['texte']}" for x in g) or "(vide)"))
+        jours = jours_du_journal()
+        aujourd = time.strftime("%Y-%m-%d")
+        recents = [j for j in jours if j <= aujourd][-2:]
+        for j in recents:
+            lignes = [ligne_journal(e) for e in journal_du(j)][-30:]
+            parties.append(f"## Journal {j}\n" + "\n".join(lignes))
+    nl = messages(pour, non_lus=True) if pour in TRIGRAMMES else []
+    if nl:
+        parties.append(f"## Messages non lus pour {pour} ({len(nl)})\n" + "\n".join(ligne_message(e) for e in nl))
+        if marquer:
+            marquer_lus([e["id"] for e in nl], pour)
+    elif seulement_messages:
+        return ""
+    if not seulement_messages:
+        parties.append("Outils : memoire_journal_ajouter (ce que tu as fait), memoire_message (à l'autre Claude), "
+                       "memoire_ajouter / memoire_corriger (faits durables).")
+    return "\n\n".join(parties)
+
+
+def regenerer_vues():
+    """Vues Markdown lisibles ; la source reste journal.jsonl."""
+    (VUES / "journal").mkdir(parents=True, exist_ok=True)
+    g = visibles()
+    par_sujet = {}
+    for x in g:
+        par_sujet.setdefault(x["sujet"] or "divers", []).append(x)
+    corps = ["# Mémoire globale", ""]
+    for sujet, xs in sorted(par_sujet.items()):
+        corps.append(f"## {sujet}")
+        corps += [f"- G{x['id']} ({x['date'][:10]}, {x['auteur']}) {x['texte']}" for x in xs]
+        corps.append("")
+    (VUES / "global.md").write_text("\n".join(corps), encoding="utf-8")
+    for j in jours_du_journal()[-3:]:
+        (VUES / "journal" / f"{j}.md").write_text(f"# Journal du {j}\n\n" + "\n".join(f"- {ligne_journal(e)}" for e in journal_du(j)) + "\n",
+                                                  encoding="utf-8")
+    ms = messages()
+    (VUES / "messages.md").write_text("# Messages entre Claude\n\n" + "\n".join(
+        f"- {ligne_message(e)}" + (f" (lu : {', '.join(e['lu_par'])})" if e["lu_par"] else " (non lu)") for e in ms) + "\n", encoding="utf-8")
+
+
+# ---------- outils MCP ----------
+INSTRUCTIONS = (
+    f"Mémoire commune à tous les Claude de l'utilisateur (comptes {' et '.join(cfg.noms())} ; terminal, VS Code, Claude Desktop). "
+    "Trois espaces : global (faits durables), journal du jour (ce que chaque Claude a fait), messages entre Claude. "
+    "Signatures : " + ", ".join(f"{t} = {n}" for n, t in TRIGRAMMES.items()) + ", UTI = utilisateur. "
+    "En début de conversation, appelle memoire_reprise si le résumé de reprise n'est pas déjà dans ton contexte. "
+    "Après chaque étape notable, ajoute une ligne au journal (memoire_journal_ajouter, court, avec le projet). "
+    "Avant une bascule de compte ou pour transmettre un contexte personnel, laisse un message (memoire_message). "
+    "Ajoute avec memoire_ajouter les faits durables utiles aux autres Claude : préférences et consignes de l'utilisateur, "
+    "décisions, état de projets, leçons. Une entrée = un fait, court, daté par le serveur. "
+    "Pour corriger, utilise memoire_corriger (l'ancienne version est gardée). Tu ne peux pas supprimer : "
+    "memoire_demander_suppression crée une demande que seul l'utilisateur valide. "
+    "Interdit : identifiants, jetons, mots de passe, extraits de bases client, adresses e-mail et numéros de téléphone. "
+    + (cfg.config()["memoire"]["consignes"] or "")
+)
+
+OUTILS = [
+    {"name": "memoire_reprise", "description": "Résumé de reprise : mémoire globale, journal d'aujourd'hui et d'hier, messages non lus pour ce compte (marqués lus). À appeler en début de conversation.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "memoire_journal_ajouter", "description": f"Ajoute au journal du jour ce que tu viens de faire (une ligne, {TAILLE_JOURNAL} caractères maximum).",
+     "inputSchema": {"type": "object", "properties": {"texte": {"type": "string"},
+                                                      "projet": {"type": "string", "description": cfg.config()["memoire"]["exemples_projet"]}},
+                     "required": ["texte"]}},
+    {"name": "memoire_journal", "description": "Lit le journal d'un jour (AAAA-MM-JJ ; aujourd'hui par défaut) ou liste les jours disponibles (jour = « liste »).",
+     "inputSchema": {"type": "object", "properties": {"jour": {"type": "string"}}}},
+    {"name": "memoire_message", "description": f"Laisse un message à l'autre Claude ({', '.join(cfg.noms())} ou tous) : contexte, mise en garde, suite à donner.",
+     "inputSchema": {"type": "object", "properties": {"a": {"type": "string", "enum": cfg.noms() + ["tous"]},
+                                                      "texte": {"type": "string"}}, "required": ["a", "texte"]}},
+    {"name": "memoire_messages", "description": "Messages pour ce compte (non lus par défaut ; tous = true pour l'historique).",
+     "inputSchema": {"type": "object", "properties": {"tous": {"type": "boolean"}}}},
+    {"name": "memoire_lire", "description": "Lit les entrées actives de la mémoire commune (toutes, ou d'un sujet).",
+     "inputSchema": {"type": "object", "properties": {"sujet": {"type": "string", "description": "Sujet exact (optionnel)"},
+                                                      "limite": {"type": "integer", "description": "Nombre maximal d'entrées (défaut 200)"}}}},
+    {"name": "memoire_chercher", "description": "Cherche un texte (mots séparés par des espaces, tous requis) dans les entrées actives.",
+     "inputSchema": {"type": "object", "properties": {"texte": {"type": "string"}}, "required": ["texte"]}},
+    {"name": "memoire_sujets", "description": "Liste les sujets existants et leur nombre d'entrées.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "memoire_historique", "description": "Montre toutes les versions d'une entrée (corrections, demandes de suppression).",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}},
+    {"name": "memoire_ajouter", "description": "Ajoute un fait durable. Un fait par entrée, sans secret ni extrait de base client.",
+     "inputSchema": {"type": "object", "properties": {
+         "sujet": {"type": "string", "description": "Sujet court en minuscules : " + cfg.config()["memoire"]["exemples_sujet"]},
+         "texte": {"type": "string", "description": f"Le fait, en français, {TAILLE_MAX} caractères maximum"}},
+         "required": ["sujet", "texte"]}},
+    {"name": "memoire_corriger", "description": "Remplace une entrée par une nouvelle version (l'ancienne reste dans l'historique).",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "texte": {"type": "string"},
+                                                      "raison": {"type": "string"}}, "required": ["id", "texte", "raison"]}},
+    {"name": "memoire_demander_suppression", "description": "Demande la suppression d'une entrée ; l'utilisateur accepte ou refuse.",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "raison": {"type": "string"}},
+                     "required": ["id", "raison"]}},
+]
+
+
+def outil(nom, a):
+    """Renvoie (texte, erreur?)."""
+    moi = compte_appelant()
+    if nom == "memoire_reprise":
+        return reprise(moi) or "Mémoire vide.", False
+    if nom == "memoire_journal_ajouter":
+        texte = a.get("texte") or ""
+        err = controler(texte, maxi=TAILLE_JOURNAL)
+        if err:
+            return err, True
+        ev = ajouter_evenement({"type": "journal", "texte": texte.strip(), "projet": (a.get("projet") or "").strip(), "auteur": auteur()})
+        return f"Journal : J{ev['id']} ajouté.", False
+    if nom == "memoire_journal":
+        jour = (a.get("jour") or "").strip()
+        if jour == "liste":
+            return "Jours : " + (", ".join(jours_du_journal()) or "aucun"), False
+        xs = journal_du(jour or None)
+        return ("\n".join(ligne_journal(e) for e in xs) or f"Journal vide pour {jour or 'aujourd’hui'}."), False
+    if nom == "memoire_message":
+        dest = a.get("a")
+        if dest not in cfg.noms() + ["tous"]:
+            return f"Destinataire : {', '.join(cfg.noms())} ou tous.", True
+        err = controler(a.get("texte") or "", maxi=TAILLE_MESSAGE)
+        if err:
+            return err, True
+        aut = auteur()
+        ev = ajouter_evenement({"type": "message", "a": dest, "texte": a["texte"].strip(), "auteur": aut,
+                                "de_compte": compte_de_auteur(aut, moi)})
+        return f"Message M{ev['id']} laissé pour {dest}.", False
+    if nom == "memoire_messages":
+        xs = messages(moi, non_lus=not a.get("tous"))
+        if not a.get("tous") and xs:
+            marquer_lus([e["id"] for e in xs], moi)
+        return ("\n".join(ligne_message(e) for e in xs) or "Aucun message."), False
+    if nom == "memoire_lire":
+        xs = visibles(a.get("sujet"))
+        lim = int(a.get("limite") or 200)
+        if not xs:
+            return "Mémoire vide" + (f" pour le sujet « {a['sujet']} »" if a.get("sujet") else "") + ".", False
+        corps = "\n\n".join(fmt(x) for x in xs[:lim])
+        return corps + (f"\n\n… {len(xs) - lim} autres entrées (augmenter limite)." if len(xs) > lim else ""), False
+    if nom == "memoire_chercher":
+        mots = [m.lower() for m in (a.get("texte") or "").split()]
+        xs = [x for x in visibles() if all(m in f"{x['sujet']} {x['texte']}".lower() for m in mots)]
+        return ("\n\n".join(fmt(x) for x in xs) or "Aucune entrée trouvée."), False
+    if nom == "memoire_sujets":
+        compte = {}
+        for x in visibles():
+            compte[x["sujet"] or "divers"] = compte.get(x["sujet"] or "divers", 0) + 1
+        return ("\n".join(f"{s} : {n}" for s, n in sorted(compte.items())) or "Aucun sujet."), False
+    if nom == "memoire_historique":
+        tous = etat()
+        i = int(a["id"])
+        if i not in tous:
+            return f"Entrée #{i} inconnue.", True
+        while tous[i].get("remplace") in tous:            # remonter à la première version
+            i = tous[i]["remplace"]
+        lignes = []
+        while i is not None and i in tous:
+            x = tous[i]
+            lignes.append(f"#{x['id']} ({x['date']}, {x['auteur']}, {x['statut']})" + (f" — raison : {x['raison']}" if x.get("raison") else "")
+                          + f"\n{x['texte']}" + (f"\nsuppression demandée : {x['demande']['raison']}" if x.get("demande") else ""))
+            i = x.get("remplacee_par")
+        return "\n\n".join(lignes), False
+    if nom == "memoire_ajouter":
+        sujet, texte = (a.get("sujet") or "divers").strip().lower(), a.get("texte") or ""
+        err = controler(texte, sujet)
+        if err:
+            return err, True
+        proche = fait_proche(texte)
+        if proche:
+            r, x = proche
+            return (f"refusé : très proche de G{x['id']} ({round(r * 100)} % ; « {x['texte'][:120]} »). "
+                    f"Si c'est une mise à jour, utiliser memoire_corriger sur G{x['id']} ; sinon reformuler."), True
+        ev = ajouter_evenement({"type": "ajout", "sujet": sujet, "texte": texte.strip(), "auteur": auteur()})
+        return f"Ajouté : #{ev['id']} [{sujet}].", False
+    if nom == "memoire_corriger":
+        tous, i = etat(), int(a["id"])
+        if i not in tous or tous[i]["statut"] not in ("active", "suppression_demandee"):
+            return f"Entrée #{i} introuvable ou déjà remplacée ou supprimée.", True
+        err = controler(a.get("texte") or "", tous[i]["sujet"])
+        if err:
+            return err, True
+        ev = ajouter_evenement({"type": "correction", "remplace": i, "sujet": tous[i]["sujet"], "texte": a["texte"].strip(),
+                                "raison": a.get("raison", ""), "auteur": auteur()})
+        return f"Corrigé : #{i} → #{ev['id']} (l'ancienne version reste dans l'historique).", False
+    if nom == "memoire_demander_suppression":
+        tous, i = etat(), int(a["id"])
+        if i not in tous or tous[i]["statut"] != "active":
+            return f"Entrée #{i} introuvable, déjà remplacée, déjà en attente ou supprimée.", True
+        ajouter_evenement({"type": "demande_suppression", "cible": i, "raison": a.get("raison", ""), "auteur": auteur()})
+        return f"Demande de suppression de #{i} enregistrée : l'utilisateur la validera.", False
+    return f"Outil inconnu : {nom}", True
+
+
+# ---------- serveur MCP (JSON-RPC sur stdio, un message par ligne) ----------
+def serveur():
+    def repondre(i, resultat=None, erreur=None):
+        msg = {"jsonrpc": "2.0", "id": i}
+        msg["error" if erreur else "result"] = erreur or resultat
+        sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+    for ligne in sys.stdin:
+        ligne = ligne.strip()
+        if not ligne:
+            continue
+        try:
+            m = json.loads(ligne)
+        except ValueError:
+            repondre(None, erreur={"code": -32700, "message": "JSON invalide"})
+            continue
+        meth, i, p = m.get("method"), m.get("id"), m.get("params") or {}
+        if i is None:                                   # notification : pas de réponse
+            continue
+        if meth == "initialize":
+            repondre(i, {"protocolVersion": p.get("protocolVersion", "2025-06-18"), "capabilities": {"tools": {}},
+                         "serverInfo": {"name": "memoire-commune", "version": VERSION}, "instructions": INSTRUCTIONS})
+        elif meth == "ping":
+            repondre(i, {})
+        elif meth == "tools/list":
+            repondre(i, {"tools": OUTILS})
+        elif meth == "tools/call":
+            try:
+                texte, err = outil(p.get("name"), p.get("arguments") or {})
+            except Exception as e:                      # ne jamais faire tomber le serveur
+                texte, err = f"Erreur interne : {e}", True
+            repondre(i, {"content": [{"type": "text", "text": texte}], "isError": err})
+        else:
+            repondre(i, erreur={"code": -32601, "message": f"Méthode inconnue : {meth}"})
+
+
+
+# ---------- commandes de l'utilisateur ----------
+def demandes():
+    return [x for x in etat().values() if x["statut"] == "suppression_demandee"]
+
+
+def purger(i):
+    tous = etat()
+    if i not in tous:
+        return f"Entrée #{i} inconnue."
+    chaine, j = set(), i                                 # toutes les versions liées
+    while tous[j].get("remplace") in tous:
+        j = tous[j]["remplace"]
+    while j is not None and j in tous:
+        chaine.add(j)
+        j = tous[j].get("remplacee_par")
+    with _verrou():
+        SAUVEGARDES.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(JOURNAL, SAUVEGARDES / f"avant-purge-{time.strftime('%Y-%m-%d-%H%M%S')}.jsonl")
+        garde = [e for e in evenements() if e.get("id") not in chaine and e.get("cible") not in chaine]
+        tmp = JOURNAL.with_suffix(".tmp")
+        tmp.write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in garde), encoding="utf-8")
+        tmp.replace(JOURNAL)
+    return (f"Purgé : {', '.join('#' + str(k) for k in sorted(chaine))}. Une copie d'avant purge est dans {SAUVEGARDES} : "
+            "la supprimer aussi si l'entrée contenait un secret.")
+
+
+def stats():
+    tous = etat().values()
+    return {"actives": sum(1 for x in tous if x["statut"] == "active"),
+            "non_lus": {c: len(messages(c, non_lus=True)) for c in TRIGRAMMES},
+            "demandes": [{"id": x["id"], "sujet": x["sujet"], "texte": x["texte"][:120], "raison": x["demande"]["raison"],
+                          "auteur": x["demande"]["auteur"]} for x in tous if x["statut"] == "suppression_demandee"]}
+
+
+# ---------- extensions locales (hors dépôt) ----------
+# Tout fichier ~/.config/claude-relais/memoire_ext_*.py est exécuté dans l'espace de noms de ce script : il peut
+# utiliser ses fonctions et ajouter des commandes dans COMMANDES_EXT (nom → fonction(argv) → code de sortie).
+COMMANDES_EXT = {}
+_AIDE = __doc__
+for _ext in sorted((HOME / ".config/claude-relais").glob("memoire_ext_*.py")):
+    exec(compile(_ext.read_text(encoding="utf-8"), str(_ext), "exec"), globals())
+__doc__ = _AIDE                                         # le docstring d'une extension ne remplace pas l'aide
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "lister"
+    if cmd in ("aide", "help", "-h", "--help"):
+        print(__doc__)
+        return 0
+    if cmd == "mcp":
+        serveur()
+        return 0
+    if cmd == "reprise":
+        pour = argv[argv.index("--pour") + 1] if "--pour" in argv else compte_appelant()
+        print(reprise(pour, seulement_messages="--messages" in argv, marquer="--sans-marquer" not in argv))
+        return 0
+    if cmd == "journal":
+        jour = argv[2] if len(argv) > 2 else None
+        print("\n".join(ligne_journal(e) for e in journal_du(jour)) or "Journal vide.")
+        return 0
+    if cmd == "message" and len(argv) > 3:
+        os.environ.setdefault("MEMOIRE_AUTEUR", "UTI")
+        ev = ajouter_evenement({"type": "message", "a": argv[2], "texte": " ".join(argv[3:]), "auteur": os.environ["MEMOIRE_AUTEUR"], "de_compte": "utilisateur"})
+        print(f"Message M{ev['id']} laissé pour {argv[2]}.")
+        return 0
+    if cmd in COMMANDES_EXT:
+        return COMMANDES_EXT[cmd](argv)
+    if cmd == "vues":
+        regenerer_vues()
+        print(VUES)
+        return 0
+    if cmd == "lister":
+        xs = visibles(argv[2] if len(argv) > 2 else None)
+        print("\n\n".join(fmt(x) for x in xs) or "Mémoire vide.")
+        return 0
+    if cmd == "chercher" and len(argv) > 2:
+        print(outil("memoire_chercher", {"texte": " ".join(argv[2:])})[0])
+        return 0
+    if cmd == "historique" and len(argv) > 2:
+        print(outil("memoire_historique", {"id": int(argv[2])})[0])
+        return 0
+    if cmd == "ajouter" and len(argv) > 3:
+        os.environ.setdefault("MEMOIRE_AUTEUR", "UTI")
+        texte, err = outil("memoire_ajouter", {"sujet": argv[2], "texte": " ".join(argv[3:])})
+        print(texte)
+        return 1 if err else 0
+    if cmd == "demandes":
+        ds = demandes()
+        print("\n\n".join(f"{fmt(x)}\n→ demandée par {x['demande']['auteur']} le {x['demande']['date']} : {x['demande']['raison']}"
+                          for x in ds) or "Aucune demande en attente.")
+        return 0
+    if cmd in ("accepter", "refuser") and len(argv) > 2:
+        i = int(argv[2])
+        if i not in {x["id"] for x in demandes()}:
+            print(f"Pas de demande en attente pour #{i}.")
+            return 1
+        ajouter_evenement({"type": "suppression_acceptee" if cmd == "accepter" else "suppression_refusee", "cible": i,
+                           "auteur": "utilisateur"})
+        print(f"#{i} : suppression {'acceptée' if cmd == 'accepter' else 'refusée'}.")
+        return 0
+    if cmd == "purger" and len(argv) > 2:
+        print(purger(int(argv[2])))
+        return 0
+    if cmd == "stats":
+        s = stats()
+        print(json.dumps(s, ensure_ascii=False) if "--json" in argv else f"{s['actives']} entrées actives, {len(s['demandes'])} demandes de suppression")
+        return 0
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
