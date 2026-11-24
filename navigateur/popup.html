@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<style>
+  :root { color-scheme: light dark; --fond: #fff; --texte: #1f1f1f; --doux: #5f6368; --ligne: #dadce0; --accent: #1a73e8; }
+  @media (prefers-color-scheme: dark) { :root { --fond: #202124; --texte: #e8eaed; --doux: #9aa0a6; --ligne: #3c4043; --accent: #8ab4f8; } }
+  body { margin: 0; padding: 12px 14px; width: 300px; font: 13px/1.4 system-ui, sans-serif; background: var(--fond); color: var(--texte); }
+  h1 { font-size: 14px; margin: 0 0 8px; }
+  .ligne { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px solid var(--ligne); }
+  .ligne span:first-child { color: var(--doux); }
+  .zone { margin-top: 10px; }
+  .zone p { margin: 0 0 6px; color: var(--doux); }
+  button { font: inherit; padding: 5px 10px; margin: 0 6px 6px 0; border: 1px solid var(--ligne); border-radius: 6px; background: transparent; color: var(--texte); cursor: pointer; }
+  button.principal { background: var(--accent); border-color: var(--accent); color: var(--fond); }
+  .erreur { color: #d93025; margin: 6px 0; }
+  .cache { display: none; }
+</style>
+</head>
+<body>
+  <h1>Relais <span id="nav"></span></h1>
+  <div id="erreur" class="erreur cache"></div>
+  <div class="ligne"><span>Compte actif (poste)</span><b id="actif">—</b></div>
+  <div class="ligne"><span>Connecté sur claude.ai</span><b id="connecte">—</b></div>
+  <div id="coffres"></div>
+
+  <div id="declarer" class="zone cache">
+    <p>Compte connecté inconnu : de quel compte s'agit-il ?</p>
+    <span id="declarer-boutons"></span>
+  </div>
+  <div id="connexion" class="zone cache"><p id="connexion-texte"></p></div>
+
+  <div class="zone">
+    <button id="basculer" class="principal">Basculer tout</button>
+    <button id="ajouter">Ajouter l'autre compte</button>
+  </div>
+  <div class="zone">
+    <button id="reconnecter">Relier</button>
+    <button id="oublier">Oublier les sessions</button>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

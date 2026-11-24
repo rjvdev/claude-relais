@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Claude Relais",
+  "version": "1.0.0",
+  "description": "Suit le compte Claude actif de Relais (claude-relais) : échange la session claude.ai à chaque bascule.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0ZZFhybUC6x96sSJc1d4vTPDIGUkfXUK74eKcUFJ2r6nnpkiijY9hV2SvyhM5165ntxiCYlcXDkFNnOgav/r5UipXYvD3VRNSlm99QhkdvAztjLaUJpbm99y0Q+7YZFBqvmCaw0PLWNxwyUNWWFhaWhEjoYHqhdhxiIypoEREaI/EIX8PUrLYr6pAOMl1+KOerRkwbfdNr5z9kpZ73gOcoZs77XPi06KpYlhGkusKKLaesBA+kPK848xUjeI3OZ1kz9rVM8ARbm/Fy0wSrfuCLHH0QnCK/LuNnj6TB0O7g4U/yVQO0Ui1581VRXSiBBZQPDBS3ZBwKRK2x/ZihSQbwIDAQAB",
+  "permissions": [
+    "cookies",
+    "storage",
+    "nativeMessaging",
+    "tabs",
+    "alarms",
+    "declarativeNetRequest"
+  ],
+  "host_permissions": [
+    "https://claude.ai/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Relais"
+  },
+  "minimum_chrome_version": "116"
+}
