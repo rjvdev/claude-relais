@@ -1,0 +1,63 @@
+{
+  "name": "claude-relais",
+  "displayName": "Claude Relais",
+  "publisher": "rjvdev",
+  "version": "1.0.0",
+  "description": "Relais : compte Claude actif dans la barre d'état, bascule en un clic, conversations du panneau Claude rouvertes sur le compte actif.",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "main": "./extension.js",
+  "extensionKind": [
+    "ui",
+    "workspace"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeRelais.menu",
+        "title": "Relais : menu"
+      },
+      {
+        "command": "claudeRelais.basculer",
+        "title": "Relais : basculer de compte"
+      },
+      {
+        "command": "claudeRelais.rouvrir",
+        "title": "Relais : rouvrir les conversations de cette fenêtre sur le compte actif"
+      },
+      {
+        "command": "claudeRelais.sonder",
+        "title": "Relais : mesurer l'usage des deux comptes"
+      },
+      {
+        "command": "claudeRelais.etat",
+        "title": "Relais : état complet"
+      }
+    ],
+    "configuration": {
+      "title": "Relais",
+      "properties": {
+        "claudeRelais.rouvrirAuto": {
+          "type": "boolean",
+          "default": true,
+          "description": "Après une bascule, rouvrir automatiquement chaque conversation du panneau Claude restée sur l'autre compte, dès la fin de sa réponse."
+        },
+        "claudeRelais.delai": {
+          "type": "number",
+          "default": 8,
+          "minimum": 0,
+          "description": "Secondes d'attente (annulables) avant de rouvrir une conversation."
+        }
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rjvdev/claude-relais"
+  },
+  "license": "MIT"
+}
