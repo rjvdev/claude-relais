@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -x bin/claude-relais bin/claude-statusline bin/claude-usage bin/claude-usage-lib.sh \
+            bin/claude-sync-mcp bin/claude-relais-hook bin/claude-relais-nm bin/claude-desktop-relais \
+            bin/cosmic-applet-claude installer.sh tests/moteur.sh
+
+  tests:
+    name: tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Python syntax
+        run: |
+          for f in bin/claude-relais-ctl bin/memoire bin/relais_config.py outils/vsix.py; do
+            python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])" "$f"
+          done
+      - name: Extensions syntax
+        run: |
+          node --version
+          for f in navigateur/background.js navigateur/popup.js vscode/extension.js; do node --check "$f"; done
+          for f in navigateur/manifest.json vscode/package.json config.example.json; do jq empty "$f"; done
+      - name: Engine (fake HOME)
+        run: tests/moteur.sh
+      - name: Browser extension (fake browser)
+        run: node tests/navigateur.test.js
+      - name: Package the VS Code extension
+        run: python3 outils/vsix.py vscode claude-relais.vsix && unzip -l claude-relais.vsix
+
+  applet:
+    name: applet
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config cmake libxkbcommon-dev libwayland-dev \
+            libexpat1-dev libfontconfig1-dev libfreetype-dev
+      - name: Build
+        working-directory: applet
+        run: cargo build --release --locked
