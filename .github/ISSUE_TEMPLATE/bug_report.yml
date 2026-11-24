@@ -1,0 +1,57 @@
+name: Bug report
+description: Something does not work as described
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Security issues must be reported privately (see SECURITY.md).
+        Never paste cookies, tokens, e-mail addresses or your config.json as is.
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      multiple: true
+      options: ["Engine / switch", "Terminal", "VS Code extension", "Browser extension", "Claude Desktop", "COSMIC applet", "Shared memory"]
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What you did, and the exact command if any.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: Output of `claude-relais-ctl status` and any error message. Remove anything private.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Distribution and desktop
+      placeholder: e.g. Pop!_OS 24.04 with COSMIC, Ubuntu 24.04 with GNOME
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Output of `claude --version`, browser and VS Code versions if relevant
+    validations:
+      required: true
+  - type: input
+    id: relais-version
+    attributes:
+      label: claude-relais version
+      description: Output of `git describe --tags --always`
