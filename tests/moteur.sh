@@ -44,4 +44,23 @@ verifier "reprise de la mémoire au démarrage" "True"       "$(python3 -c "impo
 verifier "mémoire : message"               "Message M1 laissé pour Work." "$(MEMOIRE_AUTEUR=UTI "$B/memoire" message Work bonjour)"
 verifier "mémoire : refus d'une adresse e-mail" "1"        "$("$B/memoire" ajouter test "écrire à someone@example.net" >/dev/null; echo $?)"
 verifier "mémoire : non lus pour Work"     "1"             "$("$B/memoire" stats --json | python3 -c "import json,sys; print(json.load(sys.stdin)['non_lus']['Work'])")"
+# drapeau « occupé » sans hook Stop (interruption de l'utilisateur, ou session muette depuis longtemps)
+mkdir -p "$T/.claude/projects/p"
+occ() {  # $1 = session_id, $2 = occupe (True/False), $3 = ts du dernier hook
+  python3 -I -c "import importlib.machinery as m, sys; c = m.SourceFileLoader('ctl', sys.argv[1]).load_module(); print(c.occupe_reel({'session_id': sys.argv[2], 'occupe': sys.argv[3] == 'True', 'ts': float(sys.argv[4])}))" \
+    "$B/claude-relais-ctl" "$1" "$2" "$3"; }
+maintenant=$(date +%s); iso=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+printf '%s\n' '{"type":"user","timestamp":"'"$iso"'","message":{"content":"bonjour"}}' > "$T/.claude/projects/p/actif.jsonl"
+printf '%s\n' '{"type":"user","timestamp":"'"$iso"'","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}' \
+  '{"type":"last-prompt"}' > "$T/.claude/projects/p/interrompu.jsonl"
+cp "$T/.claude/projects/p/actif.jsonl" "$T/.claude/projects/p/muet.jsonl"; touch -d '30 minutes ago' "$T/.claude/projects/p/muet.jsonl"
+cp "$T/.claude/projects/p/muet.jsonl" "$T/.claude/projects/p/agent.jsonl"; touch -d '30 minutes ago' "$T/.claude/projects/p/agent.jsonl"
+mkdir -p "$T/.claude/projects/p/agent/subagents"; echo '{}' > "$T/.claude/projects/p/agent/subagents/a.jsonl"
+verifier "occupé : réponse en cours"          "True"  "$(occ actif True "$maintenant")"
+verifier "occupé : interrompu après le hook"  "False" "$(occ interrompu True "$((maintenant - 5))")"
+verifier "occupé : interruption avant le hook" "True" "$(occ interrompu True "$((maintenant + 60))")"
+verifier "occupé : muet depuis 30 min"        "False" "$(occ muet True "$maintenant")"
+verifier "occupé : sous-agent actif"          "True"  "$(occ agent True "$maintenant")"
+verifier "occupé : inactif reste inactif"     "False" "$(occ actif False "$maintenant")"
+verifier "occupé : sans transcription"        "True"  "$(occ inconnue True "$maintenant")"
 if [ "$echecs" -eq 0 ]; then echo "tous les tests passent"; else echo "$echecs échec(s)"; exit 1; fi

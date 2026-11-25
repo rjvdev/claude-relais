@@ -101,7 +101,7 @@ Un compte est reconnu par son dossier de config, ou par l'adresse e-mail enregis
 
 ## Fonctionnement
 
-- **État** : `~/.config/claude-relais/etat.json` (compte actif, bascule automatique, navigateurs déclarés). Les sessions sont trouvées dans `/proc` ; les hooks notent si chacune est occupée dans `~/.cache/claude-relais/sessions/`.
+- **État** : `~/.config/claude-relais/etat.json` (compte actif, bascule automatique, navigateurs déclarés). Les sessions sont trouvées dans `/proc` ; les hooks notent si chacune est occupée dans `~/.cache/claude-relais/sessions/`. Une session occupée compte comme inactive si sa transcription se termine par une interruption (Claude Code ne lance alors pas le hook `Stop`) ou n'a pas été écrite depuis 20 minutes.
 - **Passation** : quand une session s'arrête sur l'ancien compte, le hook `Stop` la bloque une fois et lui demande de mettre à jour son `HANDOFF.md`, d'ajouter une ligne au journal commun et de laisser un message à l'autre compte. Au prochain arrêt, la bascule continue.
 - **VS Code** : `claudeCode.environmentVariables` reçoit le nouveau `CLAUDE_CONFIG_DIR`, donc les nouvelles conversations démarrent sur le nouveau compte. L'extension ferme puis rouvre, par identifiant de session, chaque conversation encore sur l'ancien compte dès qu'elle est inactive. Une conversation vide est remplacée par une nouvelle.
 - **Claude Desktop** : lancé avec `--user-data-dir=<profil du compte>`. À la bascule, Relais attend qu'aucune session Code de Desktop ne travaille, ferme Desktop (SIGTERM) et le relance sur l'autre profil. Les serveurs MCP du profil par défaut sont recopiés dans l'autre à chaque lancement.
