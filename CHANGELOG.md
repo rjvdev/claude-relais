@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A session interrupted by the user stayed marked busy (Claude Code runs no `Stop` hook on an interruption), so Claude Desktop waited up to 2 hours before restarting on the new account. A busy session is now treated as idle when its transcript ends with an interruption newer than the last hook, or when neither the transcript nor its subagents have been written for 20 minutes.
+
 ## [1.0.0] - 2026-11-24
 
 ### Added

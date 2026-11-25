@@ -33,7 +33,7 @@ All logic lives in `claude-relais-ctl`. The applet and both extensions only disp
 | `~/.config/claude-relais/etat.json` | runtime state: active account, automatic switch, declared browsers |
 | `~/.config/claude-relais/memoire_ext_*.py` | private memory extensions, executed in the `memoire` namespace, may add `COMMANDES_EXT` |
 | `~/.cache/claude-usage/<Name>.json` | last usage seen by the status line or `sonder` |
-| `~/.cache/claude-relais/sessions/<pid>.json` | busy / idle state of each Claude Code session, written by the hooks |
+| `~/.cache/claude-relais/sessions/<pid>.json` | busy / idle state of each Claude Code session, written by the hooks; `occupe_reel` treats it as idle after an interruption or 20 minutes without transcript writes |
 | `~/.cache/claude-relais/bascule.json` | last switch request (valid 1 h) |
 | `~/.cache/claude-relais/navigateurs/<browser>.json` | browsers whose extension is connected right now |
 | `~/.local/share/memoire-commune/` | memory journal, daily backups, Markdown views |

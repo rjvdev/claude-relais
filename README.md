@@ -101,7 +101,7 @@ An account is recognised by its config directory, or by the e-mail address store
 
 ## How it works
 
-- **State**: `~/.config/claude-relais/etat.json` (active account, automatic switch, declared browsers). Sessions are found in `/proc`; hooks record whether each one is busy in `~/.cache/claude-relais/sessions/`.
+- **State**: `~/.config/claude-relais/etat.json` (active account, automatic switch, declared browsers). Sessions are found in `/proc`; hooks record whether each one is busy in `~/.cache/claude-relais/sessions/`. A busy session counts as idle when its transcript ends with an interruption (Claude Code runs no `Stop` hook then) or has not been written for 20 minutes.
 - **Handoff**: when a session stops on the old account, the `Stop` hook blocks once and asks it to update its `HANDOFF.md`, add a line to the shared log and leave a message to the other account. At the next stop, the switch goes on.
 - **VS Code**: `claudeCode.environmentVariables` gets the new `CLAUDE_CONFIG_DIR`, so new conversations start on the new account. The extension then closes and reopens, by session id, each conversation still on the old account once it is idle. An empty conversation is replaced by a new one.
 - **Claude Desktop**: started with `--user-data-dir=<profile of the account>`. On a switch, Relais waits until no Desktop Code session is busy, closes Desktop (SIGTERM) and starts it on the other profile. MCP servers of the default profile are copied to the other one at each start.
